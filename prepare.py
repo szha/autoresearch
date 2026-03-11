@@ -308,11 +308,12 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long,
+                             device=device)
+    # cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=(device=="cuda"))
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    # cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    # cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
 
@@ -345,9 +346,9 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        inputs.copy_(row_buffer[:, :-1], non_blocking=True)
+        targets.copy_(row_buffer[:, 1:], non_blocking=True)
+        # gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------

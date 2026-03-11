@@ -99,12 +99,12 @@ class CausalSelfAttention(nn.Module):
         # Expand heads for KV based on GQA
         k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
         v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=2)
-        
+
         # Transpose to [B, H, T, D]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        
+
         # Apply mask for sliding window
         window = window_size[0]
         if window > 0 and window < T:
@@ -114,7 +114,7 @@ class CausalSelfAttention(nn.Module):
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            
+
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -335,7 +335,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     beta2_t = beta2_t.to(device=p.device, dtype=p.dtype)
     eps_t = eps_t.to(device=p.device, dtype=p.dtype)
     wd_t = wd_t.to(device=p.device, dtype=p.dtype)
-    
+
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
     exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
@@ -378,11 +378,11 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     red_dim_size = g.size(red_dim)
     v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
     v_norm = v_norm_sq.sqrt()
-    
+
     # Needs to match second_momentum_buffer.dtype for lerp_
     beta2_cast = beta2_t.to(second_momentum_buffer.dtype)
     second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2_cast)
-    
+
     step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
     scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
     v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
@@ -411,10 +411,10 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        
+
         # Compile conditionally
         compiler_kwargs = {"dynamic": False, "fullgraph": True}
-        if device_type in ("cuda", "cpu"):
+        if device_type in ("cuda", "cpu", "mps"):
             self.adamw_step_fused = torch.compile(adamw_step_fused, **compiler_kwargs)
             self.muon_step_fused = torch.compile(muon_step_fused, **compiler_kwargs)
         else:
@@ -516,15 +516,13 @@ device_type = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.m
 device = torch.device(device_type)
 
 # Autocast context
-if device_type == "cuda":
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-elif device_type == "cpu":
-    autocast_ctx = torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16)
+if device_type in ("cuda", "cpu", "mps"):
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 else:
     import contextlib
     autocast_ctx = contextlib.nullcontext()
 
-H100_BF16_PEAK_FLOPS = 989.5e12
+PEAK_FLOPS = 16.4e12
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
@@ -569,8 +567,7 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-# torch.compile is unstable on MPS, only use on CUDA
-if device_type == "cuda":
+if device_type in ("cuda", "mps"):
     model = torch.compile(model, dynamic=False)
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
@@ -607,10 +604,8 @@ total_training_time = 0
 step = 0
 
 def sync_device(device_type):
-    if device_type == "cuda":
-        torch.cuda.synchronize()
-    elif device_type == "mps":
-        torch.mps.synchronize()
+    if device_type in ("cuda", "mps"):
+        getattr(torch, device_type).synchronize()
 
 while True:
     sync_device(device_type)
@@ -656,7 +651,7 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
     print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
@@ -687,9 +682,11 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_FLOPS if total_training_time > 0 else 0
 if device_type == "cuda":
     peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+elif device_type == "mps":
+    peak_vram_mb = torch.mps.driver_allocated_memory() / 1024 / 1024
 else:
     peak_vram_mb = 0.0
 
